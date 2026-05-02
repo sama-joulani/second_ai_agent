@@ -25,6 +25,25 @@ async def _ensure_qa_report_column(conn: aiosqlite.Connection) -> None:
         await conn.commit()
 
 
+async def _ensure_progress_columns(conn: aiosqlite.Connection) -> None:
+    """
+    Older DB files may lack progress fields used by the UI.
+
+    We add them in-place so existing runs remain readable.
+    """
+    cursor = await conn.execute("PRAGMA table_info(runs);")
+    rows = await cursor.fetchall()
+    column_names = [row[1] for row in rows]
+
+    if "current_agent" not in column_names:
+        await conn.execute("ALTER TABLE runs ADD COLUMN current_agent TEXT;")
+        await conn.commit()
+
+    if "qa_revision_count" not in column_names:
+        await conn.execute("ALTER TABLE runs ADD COLUMN qa_revision_count INTEGER;")
+        await conn.commit()
+
+
 async def _ensure_schema(conn: aiosqlite.Connection) -> None:
     await conn.execute(
         """
@@ -37,12 +56,15 @@ async def _ensure_schema(conn: aiosqlite.Connection) -> None:
             competitors TEXT,
             comparison_report TEXT,
             qa_report TEXT,
-            status TEXT
+            status TEXT,
+            current_agent TEXT,
+            qa_revision_count INTEGER
         );
         """
     )
     await conn.commit()
     await _ensure_qa_report_column(conn)
+    await _ensure_progress_columns(conn)
 
 
 async def save_run(state: AgentState) -> int:
@@ -60,8 +82,9 @@ async def save_run(state: AgentState) -> int:
             """
             INSERT INTO runs (
                 created_at, user_input, product_category, target_audience,
-                competitors, comparison_report, qa_report, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                competitors, comparison_report, qa_report, status,
+                current_agent, qa_revision_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
             (
                 created_at,
@@ -72,6 +95,8 @@ async def save_run(state: AgentState) -> int:
                 state.get("comparison_report"),
                 state.get("qa_report"),
                 status,
+                state.get("current_agent"),
+                int(state.get("qa_revision_count") or 0),
             ),
         )
         await conn.commit()
@@ -93,6 +118,12 @@ async def get_run(run_id: int) -> dict[str, Any]:
         raise KeyError(f"No run with id {run_id}")
 
     data = dict(row)
+    # UI expects "run_id" (CLI adds it after save). DB stores the primary key as "id".
+    # Keep both so callers can use whichever they prefer.
+    data["run_id"] = int(data.get("id") or run_id)
+    # Backward-compatible defaults for older runs (before progress columns existed).
+    data["qa_revision_count"] = int(data.get("qa_revision_count") or 0)
+    data["current_agent"] = data.get("current_agent") or "complete"
     raw = data.get("competitors")
     if isinstance(raw, str) and raw:
         try:

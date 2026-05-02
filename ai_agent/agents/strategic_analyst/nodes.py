@@ -13,7 +13,12 @@ from google.genai import types
 
 from state.schema import AgentState
 
-from .tools import generate_content_with_retry, model_name, search_with_gemini
+from .tools import (
+    generate_content_with_retry,
+    json_with_gemini,
+    model_name,
+    search_with_gemini,
+)
 
 
 def _parse_json_object(raw: str) -> dict[str, Any]:
@@ -111,7 +116,12 @@ Product idea: {user_input}"""
 
 async def search_competitors(state: AgentState) -> dict:
     """
-    Node 2: three grounded Gemini searches run concurrently; results stored under competitors.
+    Node 2: find a canonical competitor list, then analyze that SAME list.
+
+    Why:
+    - If we ask "top competitors" and "strengths/weaknesses" as separate open-ended prompts,
+      the model can introduce new apps in the second answer.
+    - We want strengths/weaknesses to be explicitly about the competitors we found.
     """
     if state.get("error"):
         return {}
@@ -119,50 +129,126 @@ async def search_competitors(state: AgentState) -> dict:
     product_category = (state.get("product_category") or "").strip()
     target_audience = (state.get("target_audience") or "").strip()
 
-    # Prompts follow requirements.md; angles must match the expected labels exactly.
-    angles = ["top competitors", "strengths and weaknesses", "user sentiment"]
-    prompts = [
-        (
-            f"Who are the top competitors in the {product_category} market for {target_audience}? "
-            f"List the main ones with a brief description of each."
-        ),
-        (f"What are the strengths and weaknesses of the leading {product_category} apps in 2025?"),
-        (
-            f"What do users complain about most in {product_category} apps? What do they love?"
-        ),
-    ]
+    # 1) Canonical competitor list as structured JSON.
+    # We do this in TWO steps:
+    # - grounded web search (text) to gather real names
+    # - non-grounded JSON extraction to force a consistent list shape
+    top_schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "competitors": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "description": {"type": "string"},
+                    },
+                    "required": ["name", "description"],
+                },
+                "minItems": 3,
+                "maxItems": 12,
+            }
+        },
+        "required": ["competitors"],
+    }
 
-    # Run all three searches together; exceptions or empty text become state["error"], not a crash.
+    try:
+        grounded_top_text = await search_with_gemini(
+            f"Find the top competitors in the {product_category} market for {target_audience}. "
+            f"List 5-10 competitor app/product names with a 1-2 sentence description each."
+        )
+        top_data = await json_with_gemini(
+            prompt=(
+                "Extract a competitor list from the grounded research text below.\n"
+                "Return ONLY JSON matching the provided schema.\n"
+                "- Keep the competitor names exactly as written in the text when possible.\n"
+                "- If the text contains fewer than 5 clear competitors, return as many as you can.\n\n"
+                f"Grounded research text:\n{grounded_top_text}"
+            ),
+            json_schema=top_schema,
+        )
+        top_list = top_data.get("competitors") or []
+        if not isinstance(top_list, list) or not top_list:
+            raise ValueError("Top competitors JSON was empty.")
+    except Exception as exc:
+        return {
+            "competitors": [
+                {"angle": "top competitors", "findings": ""},
+                {"angle": "strengths and weaknesses", "findings": ""},
+                {"angle": "user sentiment", "findings": ""},
+            ],
+            "current_agent": "builder",
+            "error": f"top competitors: {exc!s}",
+        }
+
+    # Extract names for consistent follow-up prompts.
+    names: list[str] = []
+    for item in top_list:
+        if not isinstance(item, dict):
+            continue
+        n = str(item.get("name") or "").strip()
+        if n:
+            names.append(n)
+
+    # Keep it readable in prompts and prevent huge context.
+    names = names[:12]
+    names_text = ", ".join(names) if names else "(unknown)"
+
+    # 2) Analyze strengths/weaknesses and sentiment FOR THAT SAME LIST (run concurrently).
+    prompts = {
+        "strengths and weaknesses": (
+            f"For the following competitors in the {product_category} space for {target_audience}: {names_text}\n\n"
+            f"For EACH competitor, summarize key strengths and weaknesses.\n"
+            f"Rules:\n"
+            f"- Only discuss the competitors in the list above.\n"
+            f"- If you are unsure about a competitor, say so instead of inventing details.\n"
+        ),
+        "user sentiment": (
+            f"For the following competitors in the {product_category} space for {target_audience}: {names_text}\n\n"
+            f"Summarize what users complain about and what they love.\n"
+            f"Rules:\n"
+            f"- Focus on themes that appear across these competitors.\n"
+            f"- Do not introduce new competitor names outside the list.\n"
+        ),
+    }
+
     results_raw = await asyncio.gather(
-        *[search_with_gemini(p) for p in prompts],
+        search_with_gemini(prompts["strengths and weaknesses"]),
+        search_with_gemini(prompts["user sentiment"]),
         return_exceptions=True,
     )
 
-    competitors: list[dict[str, str]] = []
+    strengths_res, sentiment_res = results_raw
+
     error_parts: list[str] = []
+    strengths_text = ""
+    sentiment_text = ""
 
-    for angle, res in zip(angles, results_raw):
-        # Normal failures from Gemini or the SDK surface as Exception subclasses.
-        if isinstance(res, Exception):
-            error_parts.append(f"{angle}: {res!s}")
-            competitors.append({"angle": angle, "findings": ""})
-            continue
+    if isinstance(strengths_res, Exception):
+        error_parts.append(f"strengths and weaknesses: {strengths_res!s}")
+    else:
+        strengths_text = str(strengths_res).strip()
+        if not strengths_text:
+            error_parts.append("strengths and weaknesses: empty response from Gemini")
 
-        text = str(res).strip()
-        if not text:
-            error_parts.append(f"{angle}: empty response from Gemini")
-            competitors.append({"angle": angle, "findings": ""})
-        else:
-            competitors.append({"angle": angle, "findings": text})
+    if isinstance(sentiment_res, Exception):
+        error_parts.append(f"user sentiment: {sentiment_res!s}")
+    else:
+        sentiment_text = str(sentiment_res).strip()
+        if not sentiment_text:
+            error_parts.append("user sentiment: empty response from Gemini")
 
-    if error_parts:
-        return {
-            "competitors": competitors,
-            "current_agent": "builder",
-            "error": "; ".join(error_parts),
-        }
+    competitors_out = [
+        {"angle": "top competitors", "findings": json.dumps(top_data, ensure_ascii=False, indent=2)},
+        {"angle": "strengths and weaknesses", "findings": strengths_text},
+        {"angle": "user sentiment", "findings": sentiment_text},
+    ]
 
-    return {
-        "competitors": competitors,
+    out: dict[str, Any] = {
+        "competitors": competitors_out,
         "current_agent": "builder",
     }
+    if error_parts:
+        out["error"] = "; ".join(error_parts)
+    return out
