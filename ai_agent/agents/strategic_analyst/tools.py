@@ -4,6 +4,7 @@ Gemini helpers for Agent 1. Uses the official `google-genai` SDK (not deprecated
 
 import asyncio
 import os
+from typing import Any
 
 from google import genai
 from google.genai import errors as genai_errors
@@ -75,3 +76,43 @@ async def search_with_gemini(prompt: str) -> str:
         raise ValueError(f"Empty response from Gemini for prompt: {prompt!r}")
 
     return text
+
+
+async def json_with_gemini(prompt: str, json_schema: dict[str, Any]) -> dict[str, Any]:
+    """
+    Non-grounded Gemini call that returns structured JSON.
+
+    We use this when downstream steps must be consistent, e.g.:
+    - get a canonical competitor list
+    - then ask for strengths/weaknesses ONLY for that same list
+    """
+    api_key = _require_api_key()
+    client = genai.Client(api_key=api_key)
+    model = model_name()
+
+    # Note: Gemini currently rejects "tools + response_mime_type=application/json" for some tool types.
+    # So this helper does NOT use google_search grounding. If you need grounding, do it in a
+    # separate call (e.g. search_with_gemini) and then parse/extract JSON with this function.
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_json_schema=json_schema,
+    )
+
+    response = await generate_content_with_retry(
+        client.aio.models,
+        model=model,
+        contents=prompt,
+        config=config,
+    )
+
+    raw = (response.text or "").strip()
+    if not raw:
+        raise ValueError(f"Empty JSON response from Gemini for prompt: {prompt!r}")
+
+    # The SDK guarantees JSON shape via schema; still parse defensively.
+    import json as _json  # local import to keep module surface small
+
+    data = _json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("Gemini JSON response was not an object.")
+    return data
