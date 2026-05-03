@@ -79,10 +79,16 @@ Requirements:
 - Use Markdown with headings (##, ###) and bullet lists where helpful.
 - Include these sections in order:
   1) Overview
-  2) Competitive landscape
-  3) Strengths and weaknesses (synthesized across the research angles)
-  4) User sentiment themes
-  5) Strategic takeaways for this product idea
+  2) Competitive landscape — separate **direct** vs **indirect** competitors using the
+     `top competitors` JSON (relationship fields). Name each player and why they matter.
+  3) Per-competitor strengths and weaknesses — use `per_competitor_sw` and the narrative
+     `strengths and weaknesses` angle together; keep competitor names aligned with the landscape JSON.
+  4) Comparison vs this product idea — synthesize `structured_comparison` (executive_summary and
+     comparison_rows). Rows may use either a single `analysis` field per competitor (chunked extract)
+     or separate how_they_compare / strengths_relative_to_idea / weaknesses_relative_to_idea /
+     differentiation_angle fields; treat `analysis` as the full narrative when present.
+  5) User sentiment themes (from the `user sentiment` angle)
+  6) Strategic takeaways for this product idea
 - If some findings are empty or clearly incomplete, state that limitation briefly.
 - Ground the report in the supplied findings; do not claim specific metrics or facts that are not implied by them.
 

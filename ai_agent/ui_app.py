@@ -52,6 +52,61 @@ def _initial_state(user_input: str) -> AgentState:
     }
 
 
+def _competitor_row_relationship(row: dict) -> str:
+    """
+    Show direct vs indirect in tables.
+
+    Uses the same key fallbacks as the analyst post-processor so older SQLite runs
+    still render correctly. Avoid column name 'Type' in st.dataframe (Arrow/Streamlit
+    edge cases with type-like names).
+    """
+    for key in (
+        "relationship",
+        "Relationship",
+        "competitor_type",
+        "competitorType",
+        "direct_or_indirect",
+        "directOrIndirect",
+    ):
+        val = row.get(key)
+        if val is None or str(val).strip() == "":
+            continue
+        s = str(val).strip().lower().replace("_", " ")
+        if s in ("direct", "indirect"):
+            return s
+        if s.startswith("direct") or "direct competitor" in s:
+            return "direct"
+        if s.startswith("indirect") or "indirect competitor" in s:
+            return "indirect"
+        if "substitute" in s or "adjacent" in s:
+            return "indirect"
+    blob = (
+        f"{row.get('relationship_rationale', '')} "
+        f"{row.get('relationshipRationale', '')} "
+        f"{row.get('description', '')}"
+    ).lower()
+    if "indirect" in blob or "substitute" in blob or "adjacent" in blob:
+        return "indirect"
+    if "direct" in blob or "same category" in blob:
+        return "direct"
+    return "—"
+
+
+def _comparison_row_relationship(row: dict) -> str:
+    """Same idea for structured_comparison rows (different key: competitor_name)."""
+    val = row.get("relationship") or row.get("Relationship")
+    if val is None or str(val).strip() == "":
+        return "—"
+    s = str(val).strip().lower().replace("_", " ")
+    if s in ("direct", "indirect"):
+        return s
+    if s.startswith("direct"):
+        return "direct"
+    if s.startswith("indirect") or "substitute" in s:
+        return "indirect"
+    return "—"
+
+
 def _json(obj: Any) -> str:
     """Pretty JSON for display; never raise inside the UI."""
     try:
@@ -182,8 +237,21 @@ def _render_competitors(competitors: Any) -> None:
                                 continue
                             name = str(c.get("name") or "").strip()
                             desc = str(c.get("description") or "").strip()
+                            rel = _competitor_row_relationship(c)
+                            rationale = (
+                                str(c.get("relationship_rationale") or "").strip()
+                                or str(c.get("relationshipRationale") or "").strip()
+                            )
                             if name or desc:
-                                rows.append({"Name": name or "—", "Description": desc or "—"})
+                                rows.append(
+                                    {
+                                        "Name": name or "—",
+                                        # Not named "Type" — some Streamlit/Arrow paths treat that like metadata.
+                                        "Direct or indirect": rel,
+                                        "Description": desc or "—",
+                                        "Why direct/indirect": rationale or "—",
+                                    }
+                                )
 
                         if rows:
                             st.dataframe(rows, use_container_width=True, hide_index=True)
@@ -192,6 +260,75 @@ def _render_competitors(competitors: Any) -> None:
                         continue
                 except Exception:
                     # If parsing fails, fall back to showing the raw text.
+                    pass
+
+            # Structured strengths/weaknesses per competitor (JSON from analyst extraction step).
+            if angle == "per_competitor_sw" and isinstance(findings, str):
+                try:
+                    pdata = json.loads(findings)
+                    plist = (pdata or {}).get("per_competitor")
+                    if isinstance(plist, list) and plist:
+                        sw_rows = []
+                        for row in plist:
+                            if not isinstance(row, dict):
+                                continue
+                            sw_rows.append(
+                                {
+                                    "Competitor": str(row.get("name") or "").strip() or "—",
+                                    "Strengths": str(row.get("strengths") or "").strip() or "—",
+                                    "Weaknesses": str(row.get("weaknesses") or "").strip() or "—",
+                                }
+                            )
+                        if sw_rows:
+                            st.dataframe(sw_rows, use_container_width=True, hide_index=True)
+                            continue
+                except Exception:
+                    pass
+
+            # Comparison matrix vs the user's product idea (executive summary + table).
+            if angle == "structured_comparison" and isinstance(findings, str):
+                try:
+                    cdata = json.loads(findings)
+                    summary = str((cdata or {}).get("executive_summary") or "").strip()
+                    if summary:
+                        st.markdown("**Executive summary**")
+                        st.write(summary)
+                    crows = (cdata or {}).get("comparison_rows")
+                    if isinstance(crows, list) and crows:
+                        cmp_table = []
+                        for r in crows:
+                            if not isinstance(r, dict):
+                                continue
+                            analysis = str(r.get("analysis") or "").strip()
+                            htc = str(r.get("how_they_compare") or "").strip()
+                            srel = str(r.get("strengths_relative_to_idea") or "").strip()
+                            wrel = str(r.get("weaknesses_relative_to_idea") or "").strip()
+                            diff = str(r.get("differentiation_angle") or "").strip()
+                            # Chunked comparison uses a single `analysis` field per row (slim schema).
+                            if analysis and not (htc or srel or wrel or diff):
+                                cmp_table.append(
+                                    {
+                                        "Competitor": str(r.get("competitor_name") or "").strip() or "—",
+                                        "Direct or indirect": _comparison_row_relationship(r),
+                                        "Analysis vs your idea": analysis,
+                                    }
+                                )
+                            else:
+                                cmp_table.append(
+                                    {
+                                        "Competitor": str(r.get("competitor_name") or "").strip() or "—",
+                                        "Direct or indirect": _comparison_row_relationship(r),
+                                        "How they compare": htc or analysis or "—",
+                                        "Their strengths vs your idea": srel or "—",
+                                        "Their weaknesses vs your idea": wrel or "—",
+                                        "Differentiation for your idea": diff or "—",
+                                    }
+                                )
+                        if cmp_table:
+                            st.markdown("**Comparison vs your product idea**")
+                            st.dataframe(cmp_table, use_container_width=True, hide_index=True)
+                            continue
+                except Exception:
                     pass
 
             st.write(findings)
